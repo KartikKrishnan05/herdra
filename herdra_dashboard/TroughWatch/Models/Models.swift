@@ -46,21 +46,22 @@ enum WaterStatus: String, Codable, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// The headline a farmer sees — what to do, not what was measured.
     var label: String {
         switch self {
-        case .good: return "Water is fine"
-        case .warning: return "Needs a look"
-        case .bad: return "Water is bad"
-        case .unknown: return "No data yet"
+        case .good: return "All good"
+        case .warning: return "Keep an eye on it"
+        case .bad: return "Needs attention"
+        case .unknown: return "No recent news"
         }
     }
 
     var shortLabel: String {
         switch self {
-        case .good: return "Fine"
-        case .warning: return "Check"
-        case .bad: return "Bad"
-        case .unknown: return "No data"
+        case .good: return "Good"
+        case .warning: return "Watch"
+        case .bad: return "Act now"
+        case .unknown: return "No news"
         }
     }
 
@@ -84,24 +85,46 @@ enum WaterStatus: String, Codable, CaseIterable, Identifiable {
 
     /// Bad and warning troughs get a highlight ring drawn on the map.
     var needsAttention: Bool { self == .bad || self == .warning }
+
+    /// For picking the worst of several: bad beats warning beats good, and
+    /// unknown only wins when there is nothing else.
+    var severity: Int {
+        switch self {
+        case .unknown: return 0
+        case .good: return 1
+        case .warning: return 2
+        case .bad: return 3
+        }
+    }
 }
 
 // MARK: - Reading
 
-/// One measurement packet from the receiver, shaped like the fields the web
-/// dashboard reads out of `/api/data` — same names, same units.
+/// One measurement packet from the receiver: the raw fields of the sender's
+/// LoRa line, plus the depth and turbidity the app works out from them.
 struct Reading: Codable, Hashable {
     var timestamp: Date = .now
-    var status: WaterStatus = .unknown
 
-    /// TEMP, in °C.
+    /// TEMP, in °C, straight from the DS18B20.
     var temperatureC: Double?
-    /// TURB, in NTU.
-    var turbidityNTU: Double?
-    /// LEVEL, in centimetres (not a percentage — the sensor reports depth).
+    /// LVL_MV, the level sensor's output in mV at GPIO3.
+    var levelMV: Double?
+    /// TURB_MV, the turbidity sensor's output in mV at GPIO4 (after the divider).
+    var turbidityMV: Double?
+
+    /// Worked out by the app from `turbidityMV` with the trough's
+    /// `SensorCalibration`: 0 is clear water, 100 is as murky as the
+    /// calibration goes. Not NTU. Older firmware sent this as TURB.
+    var turbidityPercent: Double?
+    /// Worked out by the app from `levelMV`, in centimetres. Older firmware
+    /// sent this as LEVEL.
     var waterLevelCM: Double?
 
-    /// ALGAE, the camera's algae index.
+    /// ALGAE as sent: the share of the camera image with algae-like colour,
+    /// 0–100. A clean surface still reads around 10.
+    var cameraAlgae: Double?
+    /// Worked out by the app from `cameraAlgae` with the trough's
+    /// `SensorCalibration`: 0 is clean, 100 is fully covered.
     var algae: Double?
     /// CONF, how sure the camera is of that index, 0–100.
     var confidence: Double?
@@ -115,21 +138,28 @@ struct Reading: Codable, Hashable {
     /// CAM_AGE, seconds since the image was captured.
     var cameraAgeSeconds: Double?
 
+    /// N_LVL, N_TURB, N_TEMP, N_CAM — how many of the sender's five rounds
+    /// gave a valid value for each sensor.
+    var validLevelRounds: Int?
+    var validTurbidityRounds: Int?
+    var validTemperatureRounds: Int?
+    var validCameraRounds: Int?
+    /// BATCH, the sender's running batch number since it booted.
+    var batch: Int?
+
     /// Radio strength of the packet that carried this reading, in dBm.
     var rssi: Double?
     /// Signal-to-noise ratio of that packet, in dB.
     var snr: Double?
 
     /// The raw `TEMP=..,TURB=..` line, kept so the station can be debugged
-    /// from the phone the same way the dashboard shows it.
+    /// from the phone.
     var rawMessage: String?
 
     /// Wall-clock time the packet reached the receiver ("14:03:57").
     var serverTime: String?
 
-    /// Identifies the receiver packet this came from, so polling the same
-    /// buffer again doesn't re-file (and overwrite a hand-set status with)
-    /// a packet that has already been applied.
+    /// Identifies the receiver packet this came from.
     var packetKey: String?
 
     var cameraIsHealthy: Bool? {
@@ -139,60 +169,8 @@ struct Reading: Codable, Hashable {
 
     /// True when the packet carried no usable measurement at all.
     var isEmpty: Bool {
-        temperatureC == nil && turbidityNTU == nil && waterLevelCM == nil
-            && algae == nil && quality == nil && cameraErrorCode == nil
-    }
-}
-
-// MARK: - Status rules
-
-/// The one place that decides good / check / bad. These are the same tests the
-/// web dashboard runs for its alert banner, in the same order, so a trough is
-/// never red on one screen and green on the other.
-enum StatusRule {
-
-    /// Turbidity above this is treated as bad water.
-    static let turbidityLimitNTU: Double = 500
-    /// Below this depth the trough counts as critically low.
-    static let lowLevelCM: Double = 10
-    /// A measurement scoring under this is not trusted.
-    static let minimumQuality: Double = 50
-
-    /// The status and the sentence explaining it, for one reading.
-    static func evaluate(_ reading: Reading) -> (status: WaterStatus, reason: String) {
-
-        if reading.isEmpty {
-            return (.unknown, "No measurements in the last packet")
-        }
-
-        if let code = reading.cameraErrorCode, code != 0 {
-            return (.bad, "Camera system error")
-        }
-
-        if let quality = reading.quality, quality < minimumQuality {
-            return (.bad, "Poor measurement quality")
-        }
-
-        if let turbidity = reading.turbidityNTU, turbidity > turbidityLimitNTU {
-            return (.bad, "Water turbidity is very high")
-        }
-
-        if let level = reading.waterLevelCM {
-            if level < lowLevelCM {
-                return (.bad, "Water level is critically low")
-            }
-        } else {
-            return (.warning, "Water level measurement unavailable")
-        }
-
-        return (.good, "Water station operating normally")
-    }
-
-    /// Copy of `reading` with its status filled in from the rules above.
-    static func applied(to reading: Reading) -> Reading {
-        var copy = reading
-        copy.status = evaluate(reading).status
-        return copy
+        temperatureC == nil && turbidityPercent == nil && waterLevelCM == nil
+            && levelMV == nil && turbidityMV == nil && cameraAlgae == nil && algae == nil && quality == nil && cameraErrorCode == nil
     }
 }
 
@@ -207,11 +185,20 @@ struct Trough: Identifiable, Codable, Hashable {
     var isActive: Bool = true
     var note: String = ""
     var lastReading: Reading?
+    /// When the farmer last said they cleaned the trough. History from before
+    /// this is kept for the chart but ignored when judging the water, so old
+    /// algae doesn't keep the trough red.
+    var cleanedAt: Date?
+    /// Nil until someone changes it on the Developer tab.
+    var calibration: SensorCalibration?
+    /// How deep the water is when this trough is full, in cm, as set under
+    /// Settings. Nil means `defaultFullLevelCM`.
+    var fullLevel: Double?
 
-    var status: WaterStatus {
-        guard isActive else { return .unknown }
-        return lastReading?.status ?? .unknown
-    }
+    var sensorCalibration: SensorCalibration { calibration ?? .default }
+    var fullLevelCM: Double { fullLevel ?? Self.defaultFullLevelCM }
+
+    static let defaultFullLevelCM: Double = 18
 }
 
 // MARK: - Home

@@ -3,142 +3,164 @@
 #include "HT_SSD1306Wire.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <stdlib.h>
-#include <string.h>
+#include <esp_system.h>
 #include <math.h>
+#include <stdio.h>
+#include <string.h>
 
-// =====================================================
-// CAMERA UART
-// =====================================================
+// HELTEC WIFI LORA 32 V3
+// Pressure converter OUT -> GPIO3; converter GND -> Heltec GND.
+// Turbidity OUT -> 10k -> GPIO4; GPIO4 -> 20k -> GND.
+// DS18B20 data -> GPIO19, with 4.7k-5.1k pull-up to 3.3V.
+// DS18B20 supply -> 3.3V, GND -> GND. GPIO22 does NOT exist on ESP32-S3.
+// Camera GPIO1 TX -> Heltec GPIO6 RX.
+// Camera GPIO2 RX <- Heltec GPIO7 TX. Common GND required.
+// Sensors remain powered. Scheduling is NOT power switching.
+// Flash off / camera awaiting commands does not mean camera power is off.
 
-// Camera GPIO1 TX -> Heltec GPIO6 RX
-// Camera GPIO2 RX <- Heltec GPIO7 TX
-// Camera GND      -> Heltec GND
+const int LEVEL_PIN = 3;
+const int TURBIDITY_PIN = 4;
+const int ONE_WIRE_BUS = 19;
+const int LINK_RX = 6, LINK_TX = 7;
+const uint32_t LINK_BAUD = 115200;
 
-#define LINK_RX   6
-#define LINK_TX   7
-#define LINK_BAUD 115200
+// No calibration here: the sender reports raw millivolts at the ADC pins and
+// the TroughWatch app turns them into depth (cm) and turbidity (%), using a
+// calibration stored per trough in the app (Developer tab).
+// TURB_MV is measured at GPIO4, i.e. AFTER the 10k/20k divider.
 
-#define DEBUG_RX_BYTES false
+// Five complete rounds, then median across the valid round results.
+// A minimum of 3 valid results per sensor is required.
+const uint8_t ROUNDS = 3, MIN_VALID = 2;
+const uint16_t ADC_SAMPLES = 50;
+const uint32_t ADC_INTERVAL_MS = 5;
+const uint32_t SETTLE_MS = 200;
+const uint32_t CAMERA_TIMEOUT_MS = 15000;
+const uint32_t SYNC_RETRY_MS = 3000;
+// Minimum start-to-start cycle period; never overlap cycles.
+const uint32_t CYCLE_INTERVAL_MS = 30000;
 
-HardwareSerial Link(1);
-
-// =====================================================
-// TURBIDITY SENSOR
-// =====================================================
-
-// Sensor analog output -> 10k resistor -> GPIO5 junction
-// GPIO5                -> 20k resistor -> GND
-// Sensor GND           -> Heltec GND
-
-const int TURBIDITY_PIN = 5;
-
-const float V_CLEAR = 4.29f;
-const float V_DIRTY = 1.06f;
-
-// 10k / 20k voltage divider
-const float DIVIDER_FACTOR = 1.5f;
-
-const uint16_t TURBIDITY_SAMPLES = 100;
-const uint32_t SAMPLE_INTERVAL_MS = 5;
-const uint32_t TURBIDITY_PAUSE_MS = 1000;
-
-// =====================================================
-// DS18B20 TEMPERATURE SENSOR
-// =====================================================
-
-// Red    -> 3.3V
-// Black  -> GND
-// Yellow -> GPIO19
-//
-// Pull-up resistor:
-// 3.3V -> 5.1k -> GPIO19 / Yellow
-
-#define ONE_WIRE_BUS 19
-
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
-
-bool hasTemperature = false;
-float waterTemperature = 0.0f;
-
-const uint32_t TEMP_INTERVAL_MS = 2000;
-const uint32_t TEMP_CONVERSION_MS = 750;
-
-// =====================================================
-// OLED DISPLAY
-// =====================================================
-
-static SSD1306Wire display(
-  0x3c,
-  500000,
-  SDA_OLED,
-  SCL_OLED,
-  GEOMETRY_128_64,
-  RST_OLED
-);
-
-// =====================================================
-// CAMERA READINGS
-// =====================================================
-
-bool hasReading = false;
-float lastValue = 0.0f;
-float lastConfidence = 0.0f;
-float lastQuality = 0.0f;
-bool hasConfidence = false;
-bool cameraError = false;
-char cameraErrorCode[16] = "";
-uint32_t lastRxMs = 0;
-uint32_t readingCount = 0;
-
-// =====================================================
-// TURBIDITY READINGS
-// =====================================================
-
-bool hasTurbidity = false;
-
-float gpioVoltage = 0.0f;
-float sensorVoltage = 0.0f;
-float turbidity = 0.0f;
-
-// =====================================================
-// LORA: matches the supplied receiver
-// =====================================================
 #define RF_FREQUENCY 868000000
 #define TX_OUTPUT_POWER 14
 #define LORA_BANDWIDTH 0
 #define LORA_SPREADING_FACTOR 7
 #define LORA_CODINGRATE 1
 #define LORA_PREAMBLE_LENGTH 8
-#define LORA_FIX_LENGTH_PAYLOAD_ON false
-#define LORA_IQ_INVERSION_ON false
 #define TX_TIMEOUT_VALUE 3000
 
-// First packet after 5 seconds; subsequent packets every 30 seconds.
-const uint32_t SEND_INTERVAL_MS = 30000;
+HardwareSerial Link(1);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+static SSD1306Wire display(
+  0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED
+);
 static RadioEvents_t RadioEvents;
-bool transmitting = false;
-uint32_t lastSendMs = 0;
-uint32_t sentCount = 0;
+
+enum Stage {
+  WAIT_CYCLE, SYNC_CAMERA, LEVEL_SETTLE, LEVEL_SAMPLE,
+  TURB_SETTLE, TURB_SAMPLE, TEMP_READ, CAMERA_WAIT, TX_WAIT
+};
+void changeStage(Stage next); // Explicit prototype for Arduino sketch preprocessing.
+Stage stage = WAIT_CYCLE;
+uint32_t stageMs = 0, cycleMs = 0, sampleMs = 0;
+uint32_t requestId = 0, activeId = 0, batchId = 0;
+uint32_t sentCount = 0, lastDisplayMs = 0;
+uint8_t roundIndex = 0;
+bool firstCycle = true, recovering = false, transmitting = false;
+bool cameraHadError = false;
 const char *txStatus = "Ready";
-// Persistent buffer remains valid until transmission completes.
 char txPacket[256];
+uint16_t adcSamples[ADC_SAMPLES];
+uint16_t adcCount = 0;
+
+float levelRounds[ROUNDS], turbRounds[ROUNDS], tempRounds[ROUNDS];
+float algaeRounds[ROUNDS], confRounds[ROUNDS], qualityRounds[ROUNDS];
+float resultLevelMV = NAN, resultTurbMV = NAN, resultTemp = NAN;
+float resultAlgae = NAN, resultConf = NAN, resultQuality = NAN;
+uint8_t nLevel = 0, nTurb = 0, nTemp = 0, nCamera = 0;
+bool hasBatch = false;
+uint32_t lastCameraMs = 0;
+
+float median(float *values, uint16_t count) {
+  if (!count) return NAN;
+  for (uint16_t i = 1; i < count; ++i) {
+    const float value = values[i];
+    int j = i - 1;
+    while (j >= 0 && values[j] > value) {
+      values[j + 1] = values[j];
+      --j;
+    }
+    values[j + 1] = value;
+  }
+  if (count % 2) return values[count / 2];
+  return (values[count / 2 - 1] + values[count / 2]) / 2.0f;
+}
+
+float roundMedian(const float *values, uint8_t &validCount) {
+  float valid[ROUNDS];
+  validCount = 0;
+  for (uint8_t i = 0; i < ROUNDS; ++i)
+    if (isfinite(values[i])) valid[validCount++] = values[i];
+  return validCount >= MIN_VALID ? median(valid, validCount) : NAN;
+}
+
+void changeStage(Stage next) {
+  stage = next;
+  stageMs = millis();
+}
+
+const char *stageName() {
+  switch (stage) {
+    case WAIT_CYCLE: return "Waiting";
+    case SYNC_CAMERA: return "Camera sync";
+    case LEVEL_SETTLE: case LEVEL_SAMPLE: return "Level";
+    case TURB_SETTLE: case TURB_SAMPLE: return "Turbidity";
+    case TEMP_READ: return "Temperature";
+    case CAMERA_WAIT: return "Camera";
+    case TX_WAIT: return "LoRa";
+  }
+  return "?";
+}
+
+void drawScreen() {
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+  char text[48];
+  snprintf(text, sizeof(text), "%s R%d/5", stageName(), roundIndex + 1);
+  display.drawString(0, 0, text);
+  if (isfinite(resultLevelMV)) snprintf(text, sizeof(text), "Level: %.0f mV", resultLevelMV);
+  else snprintf(text, sizeof(text), "Level: --");
+  display.drawString(0, 12, text);
+  if (isfinite(resultTurbMV)) snprintf(text, sizeof(text), "Turb: %.0f mV", resultTurbMV);
+  else snprintf(text, sizeof(text), "Turb: --");
+  display.drawString(0, 24, text);
+  if (isfinite(resultTemp)) snprintf(text, sizeof(text), "Temp: %.2f C", resultTemp);
+  else snprintf(text, sizeof(text), "Temp: --");
+  display.drawString(0, 36, text);
+  if ((millis() / 3000) % 2 == 0) {
+    if (isfinite(resultAlgae)) snprintf(text, sizeof(text), "Algae: %.1f%%", resultAlgae);
+    else snprintf(text, sizeof(text), "Algae: --");
+  } else {
+    snprintf(text, sizeof(text), "B%lu %s #%lu",
+      (unsigned long)(hasBatch ? batchId : 0), txStatus, (unsigned long)sentCount);
+  }
+  display.drawString(0, 48, text);
+  display.display();
+}
 
 void OnTxDone() {
   Radio.Sleep();
   transmitting = false;
   sentCount++;
   txStatus = "Sent";
-  Serial.printf("LoRa TX complete #%lu (no receiver acknowledgement)\n",
-                (unsigned long)sentCount);
+  Serial.println("LoRa TX complete (no receiver acknowledgement)");
 }
-
 void OnTxTimeout() {
   Radio.Sleep();
   transmitting = false;
   txStatus = "Timeout";
-  Serial.println("LoRa TX timeout; next attempt at scheduled interval");
+  Serial.println("LoRa TX timeout");
 }
 
 void initLoRa() {
@@ -146,577 +168,303 @@ void initLoRa() {
   RadioEvents.TxTimeout = OnTxTimeout;
   Radio.Init(&RadioEvents);
   Radio.SetChannel(RF_FREQUENCY);
-  Radio.SetTxConfig(
-    MODEM_LORA, TX_OUTPUT_POWER, 0,
+  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0,
     LORA_BANDWIDTH, LORA_SPREADING_FACTOR, LORA_CODINGRATE,
-    LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
-    true, 0, 0, LORA_IQ_INVERSION_ON, TX_TIMEOUT_VALUE
-  );
+    LORA_PREAMBLE_LENGTH, false, true, 0, 0, false, TX_TIMEOUT_VALUE);
   Radio.Sleep();
-  lastSendMs = millis() - (SEND_INTERVAL_MS - 5000);
-  Serial.println("LoRa ready: 868 MHz, BW125, SF7, CR4/5, CRC on");
 }
 
-void sendLoRaData() {
-  const uint32_t now = millis();
-  if (transmitting || now - lastSendMs < SEND_INTERVAL_MS) return;
-  lastSendMs = now;
+void formatValue(char *out, size_t size, float value, int decimals) {
+  if (isfinite(value)) snprintf(out, size, "%.*f", decimals, value);
+  else snprintf(out, size, "NA");
+}
 
-  const bool fresh = hasReading && !cameraError && now - lastRxMs < 10000;
-  const bool measurable = fresh && (!hasConfidence || lastQuality > 0);
-  // NA means unavailable; never substitute a made-up zero reading.
-  char temp[16] = "NA", turb[16] = "NA", algae[16] = "NA";
-  char confidence[16] = "NA", quality[16] = "NA", age[16] = "NA";
-  if (hasTemperature) snprintf(temp, sizeof(temp), "%.2f", waterTemperature);
-  if (hasTurbidity) snprintf(turb, sizeof(turb), "%.1f", turbidity);
-  if (measurable) snprintf(algae, sizeof(algae), "%.2f", lastValue);
-  if (fresh && hasConfidence) {
-    snprintf(confidence, sizeof(confidence), "%.2f", lastConfidence);
-    snprintf(quality, sizeof(quality), "%.2f", lastQuality);
-  }
-  if (hasReading)
-    snprintf(age, sizeof(age), "%lu", (unsigned long)((now - lastRxMs) / 1000));
+// Called only after round 5 completes and the camera reports flash OFF.
+void finishBatch() {
+  resultLevelMV = roundMedian(levelRounds, nLevel);
+  resultTurbMV = roundMedian(turbRounds, nTurb);
+  resultTemp = roundMedian(tempRounds, nTemp);
+  resultAlgae = roundMedian(algaeRounds, nCamera);
+  uint8_t ignored;
+  resultConf = roundMedian(confRounds, ignored);
+  resultQuality = roundMedian(qualityRounds, ignored);
+  hasBatch = true;
 
-  // TURB is the original calibrated percentage, NOT NTU.
-  // CONF is a heuristic score, NOT a calibrated probability.
-  // LEVEL is unavailable: the supplied sketch has no level sensor code.
-  const int length = snprintf(txPacket, sizeof(txPacket),
-    "TEMP=%s,TURB=%s,LEVEL=NA,ALGAE=%s,CONF=%s,QUALITY=%s,CAM_FRESH=%d,CAM_ERR=%d,CAM_AGE=%s",
-    temp, turb, algae, confidence, quality, fresh ? 1 : 0,
-    cameraError ? 1 : 0, age);
-  if (length <= 0 || length >= (int)sizeof(txPacket)) {
+  char level[16], turb[16], temp[16], algae[16], conf[16], quality[16], age[16];
+  formatValue(level, sizeof(level), resultLevelMV, 1);
+  formatValue(turb, sizeof(turb), resultTurbMV, 1);
+  formatValue(temp, sizeof(temp), resultTemp, 2);
+  formatValue(algae, sizeof(algae), resultAlgae, 2);
+  formatValue(conf, sizeof(conf), resultConf, 2);
+  formatValue(quality, sizeof(quality), resultQuality, 2);
+  if (nCamera)
+    snprintf(age, sizeof(age), "%lu", (unsigned long)((millis() - lastCameraMs) / 1000));
+  else snprintf(age, sizeof(age), "NA");
+
+  // Fresh means a valid aggregate from THIS completed batch.
+  // CAM_AGE is the age of its latest valid camera observation.
+  // CONF remains a heuristic, not a probability.
+  // Raw values only: LVL_MV / TURB_MV are ADC-pin millivolts, TEMP is the
+  // DS18B20's own reading in C. N_* are valid rounds out of 5 per sensor.
+  // Worst case is ~170 bytes, inside the 255-byte LoRa limit.
+  int length = snprintf(txPacket, sizeof(txPacket),
+    "TEMP=%s,LVL_MV=%s,TURB_MV=%s,ALGAE=%s,CONF=%s,QUALITY=%s,"
+    "CAM_FRESH=%d,CAM_ERR=%d,CAM_AGE=%s,"
+    "N_LVL=%u,N_TURB=%u,N_TEMP=%u,N_CAM=%u,BATCH=%lu",
+    temp, level, turb, algae, conf, quality,
+    isfinite(resultAlgae) ? 1 : 0, cameraHadError ? 1 : 0, age,
+    (unsigned)nLevel, (unsigned)nTurb, (unsigned)nTemp, (unsigned)nCamera,
+    (unsigned long)batchId);
+
+  Serial.printf("\nBATCH %lu: median of 5 rounds\n", (unsigned long)batchId);
+  Serial.printf("Valid: level=%u turb=%u temp=%u camera=%u\n",
+    (unsigned)nLevel, (unsigned)nTurb, (unsigned)nTemp, (unsigned)nCamera);
+
+  if (length <= 0 || length >= (int)sizeof(txPacket) || length > 255) {
     txStatus = "Too long";
-    Serial.println("LoRa packet exceeds buffer; not sent");
+    Serial.println("Packet too long; not sent");
+    changeStage(WAIT_CYCLE);
+    drawScreen();
     return;
   }
-  Serial.printf("LoRa sending (%d bytes): %s\n", length, txPacket);
+  Serial.printf("LoRa sending: %s\n\n", txPacket);
   transmitting = true;
   txStatus = "Sending";
+  changeStage(TX_WAIT);
+  drawScreen();
   Radio.Send((uint8_t *)txPacket, (uint8_t)length);
 }
 
-// =====================================================
-// OLED SCREEN
-// =====================================================
-
-void drawScreen() {
-  display.clear();
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.setFont(ArialMT_Plain_10);
-  char text[48];
-  const bool fresh = hasReading && !cameraError && millis() - lastRxMs < 10000;
-  if (hasReading) snprintf(text, sizeof(text), "Cov: %.1f%%%s", lastValue, fresh ? "" : " OLD");
-  else snprintf(text, sizeof(text), "Coverage: --");
-  display.drawString(0, 0, text);
-  // * = heuristic evidence score, NOT a calibrated probability.
-  if (hasReading && hasConfidence)
-    snprintf(text, sizeof(text), "Conf*: %.1f%%%s", lastConfidence, fresh ? "" : " OLD");
-  else snprintf(text, sizeof(text), "Conf*: --");
-  display.drawString(0, 12, text);
-  if (hasTurbidity) snprintf(text, sizeof(text), "Turbidity: %.1f%%", turbidity);
-  else snprintf(text, sizeof(text), "Turbidity: --");
-  display.drawString(0, 24, text);
-  if (hasTemperature) snprintf(text, sizeof(text), "Temp: %.2f C", waterTemperature);
-  else snprintf(text, sizeof(text), "Temp: --");
-  display.drawString(0, 36, text);
-  if (hasReading && !fresh)
-    snprintf(text, sizeof(text), "Last %lus / %s",
-             (unsigned long)((millis() - lastRxMs) / 1000),
-             cameraError ? cameraErrorCode : "NO DATA");
-  else if (!hasReading)
-    snprintf(text, sizeof(text), "Camera: %s", cameraError ? cameraErrorCode : "waiting");
-  else if (!hasConfidence) snprintf(text, sizeof(text), "Camera: legacy data");
-  else if (lastQuality == 0) snprintf(text, sizeof(text), "UNMEASURABLE Q:0");
-  else snprintf(text, sizeof(text), "View: %.0f%%%s", lastQuality,
-                lastQuality < 60.0f ? " LOW" : " usable");
-  // Alternate the bottom line to retain camera diagnostics and show TX status.
-  if ((millis() / 3000) % 2 == 1) {
-    snprintf(text, sizeof(text), "LoRa: %s #%lu", txStatus, (unsigned long)sentCount);
+void nextRound() {
+  if (roundIndex + 1 >= ROUNDS) {
+    finishBatch();
+    return;
   }
-  display.drawString(0, 48, text);
-  display.display();
+  ++roundIndex;
+  Serial.printf("\nROUND %u/5\n", (unsigned)(roundIndex + 1));
+  changeStage(LEVEL_SETTLE);
+  drawScreen(); // No OLED traffic during actual ADC collection.
 }
 
-// =====================================================
-// CAMERA LINE PARSER
-// =====================================================
+void syncCamera(bool recovery) {
+  recovering = recovery;
+  activeId = ++requestId;
+  changeStage(SYNC_CAMERA);
+  Link.printf("PING:%lu\n", (unsigned long)activeId);
+}
 
-// Advance only over a finite percentage; separators checked by caller.
-bool parsePercent(const char *&cursor, float &value) {
-  char *end = nullptr;
-  value = strtof(cursor, &end);
-  if (end == cursor || !isfinite(value) || value < 0 || value > 100)
-    return false;
-  cursor = end;
+void startBatch() {
+  firstCycle = false;
+  cycleMs = millis();
+  ++batchId;
+  roundIndex = 0;
+  cameraHadError = false;
+  for (uint8_t i = 0; i < ROUNDS; ++i) {
+    levelRounds[i] = turbRounds[i] = tempRounds[i] = NAN;
+    algaeRounds[i] = confRounds[i] = qualityRounds[i] = NAN;
+  }
+  Radio.Sleep();
+  Serial.printf("\nBATCH %lu: waiting for camera idle\n", (unsigned long)batchId);
+  syncCamera(false);
+}
+
+bool percentage(float x) { return isfinite(x) && x >= 0 && x <= 100; }
+
+// Responses carry a request ID, so late/duplicate replies cannot enter
+// a different round. Any result/error is sent only AFTER flash is OFF.
+void processCameraLine(const char *line) {
+  unsigned long id = 0;
+  int used = 0;
+  if (stage == SYNC_CAMERA &&
+      sscanf(line, "IDLE:%lu%n", &id, &used) == 1 &&
+      used > 0 && line[used] == '\0' && id == activeId) {
+    if (recovering) {
+      nextRound(); // Timed-out camera round remains invalid.
+    } else {
+      Serial.println("Camera idle confirmed; ROUND 1/5");
+      changeStage(LEVEL_SETTLE);
+      drawScreen();
+    }
+    return;
+  }
+  if (stage != CAMERA_WAIT) return;
+
+  float g = NAN, c = NAN, q = NAN;
+  used = 0;
+  if (sscanf(line, "R:%lu,G:%f,C:%f,Q:%f%n", &id, &g, &c, &q, &used) == 4 &&
+      used > 0 && line[used] == '\0' && id == activeId &&
+      percentage(g) && percentage(c) && percentage(q)) {
+    Serial.printf("Round %u camera: G=%.2f C*=%.2f Q=%.2f (flash OFF)\n",
+      (unsigned)(roundIndex + 1), g, c, q);
+    if (q > 0) {
+      algaeRounds[roundIndex] = g;
+      confRounds[roundIndex] = c;
+      qualityRounds[roundIndex] = q;
+      lastCameraMs = millis();
+    } else {
+      cameraHadError = true;
+      Serial.println("Camera Q=0: unmeasurable, not clean water");
+    }
+    nextRound();
+    return;
+  }
+  char error[24];
+  used = 0;
+  if (sscanf(line, "E:%lu,%23[A-Z_]%n", &id, error, &used) == 2 &&
+      used > 0 && line[used] == '\0' && id == activeId) {
+    cameraHadError = true;
+    Serial.printf("Camera error: %s (flash OFF)\n", error);
+    nextRound();
+  }
+}
+
+void receiveCamera() {
+  static char line[100];
+  static uint8_t pos = 0;
+  static bool discard = false;
+  while (Link.available()) {
+    int ch = Link.read();
+    if (ch < 0) break;
+    if (ch == '\n' || ch == '\r') {
+      if (!discard && pos) {
+        line[pos] = '\0';
+        processCameraLine(line);
+      }
+      pos = 0;
+      discard = false;
+    } else if (!discard) {
+      if (ch < 32 || ch > 126 || pos >= sizeof(line) - 1) {
+        discard = true;
+        pos = 0;
+      } else line[pos++] = (char)ch;
+    }
+  }
+}
+
+void startADC(int pin, Stage next) {
+  analogReadMilliVolts(pin); // Discard first read after channel switch.
+  adcCount = 0;
+  sampleMs = millis();
+  changeStage(next);
+}
+
+bool collectADC(int pin, float &mv) {
+  if (millis() - sampleMs < ADC_INTERVAL_MS) return false;
+  sampleMs = millis();
+  adcSamples[adcCount++] = (uint16_t)analogReadMilliVolts(pin);
+  if (adcCount < ADC_SAMPLES) return false;
+  float values[ADC_SAMPLES];
+  for (uint16_t i = 0; i < ADC_SAMPLES; ++i) values[i] = adcSamples[i];
+  mv = median(values, ADC_SAMPLES);
   return true;
 }
 
-void processLine(const char *line) {
-  if (strncmp(line, "E:", 2) == 0) {
-    cameraError = true;
-    snprintf(cameraErrorCode, sizeof(cameraErrorCode), "%.15s", line + 2);
-    // Retain last successful values and timestamp. Never label them fresh.
-    Serial.printf("Camera error: %s; retaining last reading\n", cameraErrorCode);
-    return;
-  }
-  if (strncmp(line, "G:", 2) != 0) return;
-  Serial.printf("Camera RX: %s\n", line);
-  const char *cursor = line + 2;
-  float coverage, confidence = 0, quality = 0;
-  if (!parsePercent(cursor, coverage)) return;
-  bool complete = false;
-  // Accept legacy G:23.50 without inventing a confidence score.
-  if (*cursor != '\0') {
-    if (strncmp(cursor, ",C:", 3) != 0) return;
-    cursor += 3;
-    if (!parsePercent(cursor, confidence)) return;
-    if (strncmp(cursor, ",Q:", 3) != 0) return;
-    cursor += 3;
-    if (!parsePercent(cursor, quality) || *cursor != '\0') return;
-    complete = true;
-  }
-  // Commit all values together only after the whole packet validates.
-  lastValue = coverage;
-  lastConfidence = confidence;
-  lastQuality = quality;
-  hasConfidence = complete;
-  hasReading = true;
-  cameraError = false;
-  cameraErrorCode[0] = '\0';
-  lastRxMs = millis();
-  readingCount++;
-  Serial.printf("Coverage: %.2f%%", lastValue);
-  if (complete) Serial.printf(" | Confidence* (heuristic): %.2f%% | Usable: %.2f%%",
-                              lastConfidence, lastQuality);
-  Serial.println();
-}
-
-// =====================================================
-// CAMERA UART RECEIVER
-// =====================================================
-
-void receiveCameraData() {
-
-  static char line[80];
-
-  static size_t idx = 0;
-
-  static bool discardLine = false;
-
-  while (Link.available() > 0) {
-
-    const int incoming =
-      Link.read();
-
-    if (incoming < 0)
-      break;
-
-    const uint8_t ch =
-      (uint8_t)incoming;
-
-    if (DEBUG_RX_BYTES) {
-
-      Serial.printf(
-        "RX byte: 0x%02X\n",
-        (unsigned int)ch
-      );
-    }
-
-    // End of line
-    if (
-      ch == '\n' ||
-      ch == '\r'
-    ) {
-
-      if (
-        !discardLine &&
-        idx > 0
-      ) {
-
-        line[idx] = '\0';
-
-        processLine(line);
-      }
-
-      idx = 0;
-
-      discardLine = false;
-    }
-
-    else if (!discardLine) {
-
-      // Reject invalid bytes
-      if (
-        ch < 32 ||
-        ch > 126
-      ) {
-
-        Serial.println(
-          "Invalid UART byte"
-        );
-
-        discardLine = true;
-
-        idx = 0;
-      }
-
-      // Store character
-      else if (
-        idx < sizeof(line) - 1
-      ) {
-
-        line[idx++] =
-          (char)ch;
-      }
-
-      // Line too long
-      else {
-
-        Serial.println(
-          "UART line too long"
-        );
-
-        discardLine = true;
-
-        idx = 0;
-      }
-    }
-  }
-}
-
-// =====================================================
-// NON-BLOCKING TURBIDITY
-// =====================================================
-
-void updateTurbidity() {
-
-  static uint32_t totalMv = 0;
-
-  static uint16_t sampleCount = 0;
-
-  static uint32_t lastSampleMs = 0;
-
-  static uint32_t pauseStartedMs = 0;
-
-  static bool paused = false;
-
-  const uint32_t now =
-    millis();
-
-  // Wait between batches
-  if (paused) {
-
-    if (
-      now - pauseStartedMs <
-      TURBIDITY_PAUSE_MS
-    ) {
-
-      return;
-    }
-
-    paused = false;
-  }
-
-  // Wait until next ADC sample
-  if (
-    now - lastSampleMs <
-    SAMPLE_INTERVAL_MS
-  ) {
-
-    return;
-  }
-
-  lastSampleMs = now;
-
-  // ADC measurement
-  totalMv +=
-    analogReadMilliVolts(
-      TURBIDITY_PIN
-    );
-
-  sampleCount++;
-
-  if (
-    sampleCount <
-    TURBIDITY_SAMPLES
-  ) {
-
-    return;
-  }
-
-  // Average ADC voltage
-  gpioVoltage =
-    (totalMv /
-    (float)TURBIDITY_SAMPLES)
-    / 1000.0f;
-
-  // Reconstruct actual sensor voltage
-  sensorVoltage =
-    gpioVoltage *
-    DIVIDER_FACTOR;
-
-  // Convert voltage to turbidity %
-  turbidity =
-    100.0f *
-    (V_CLEAR - sensorVoltage) /
-    (V_CLEAR - V_DIRTY);
-
-  // Limit 0–100 %
-  if (turbidity < 0.0f)
-    turbidity = 0.0f;
-
-  if (turbidity > 100.0f)
-    turbidity = 100.0f;
-
-  hasTurbidity = true;
-
-  Serial.printf(
-    "Turbidity: %.1f%% | "
-    "Sensor voltage: %.3f V\n",
-    turbidity,
-    sensorVoltage
-  );
-
-  // Reset averaging
-  totalMv = 0;
-
-  sampleCount = 0;
-
-  paused = true;
-
-  pauseStartedMs = millis();
-}
-
-// =====================================================
-// NON-BLOCKING DS18B20 TEMPERATURE
-// =====================================================
-
-void updateTemperature() {
-
-  static bool conversionRunning = false;
-
-  static uint32_t conversionStartedMs = 0;
-
-  static uint32_t lastTemperatureMs = 0;
-
-  const uint32_t now =
-    millis();
-
-  // Start new measurement
-  if (!conversionRunning) {
-
-    if (
-      now - lastTemperatureMs >=
-      TEMP_INTERVAL_MS
-    ) {
-
-      sensors.requestTemperatures();
-
-      conversionStartedMs = now;
-
-      conversionRunning = true;
-    }
-
-    return;
-  }
-
-  // Wait for DS18B20 conversion
-  if (
-    now - conversionStartedMs <
-    TEMP_CONVERSION_MS
-  ) {
-
-    return;
-  }
-
-  // Read finished conversion
-  float temp =
-    sensors.getTempCByIndex(0);
-
-  conversionRunning = false;
-
-  lastTemperatureMs = now;
-
-  if (
-    temp ==
-    DEVICE_DISCONNECTED_C
-  ) {
-
-    hasTemperature = false;
-
-    Serial.println(
-      "Temperature sensor not found!"
-    );
-
-    return;
-  }
-
-  waterTemperature = temp;
-
-  hasTemperature = true;
-
-  Serial.printf(
-    "Water temperature: %.2f C\n",
-    waterTemperature
-  );
-}
-
-// =====================================================
-// SETUP
-// =====================================================
-
 void setup() {
-
   Serial.begin(115200);
-
-  delay(100);
-
+  delay(1000);
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
-
-  // ---------------------------------------------------
-  // OLED
-  // ---------------------------------------------------
-
-  // Heltec Vext is active LOW
   pinMode(Vext, OUTPUT);
-
   digitalWrite(Vext, LOW);
-
   delay(100);
-
   display.init();
-
-  display.clear();
-
-  display.setTextAlignment(
-    TEXT_ALIGN_LEFT
-  );
-
-  display.setFont(
-    ArialMT_Plain_10
-  );
-
-  display.drawString(
-    0,
-    0,
-    "Herdra starting..."
-  );
-
-  display.display();
-
-  // ---------------------------------------------------
-  // CAMERA UART
-  // ---------------------------------------------------
-
-  Link.begin(
-    LINK_BAUD,
-    SERIAL_8N1,
-    LINK_RX,
-    LINK_TX
-  );
-
-  // ---------------------------------------------------
-  // TURBIDITY ADC
-  // ---------------------------------------------------
-
-  pinMode(
-    TURBIDITY_PIN,
-    INPUT
-  );
-
+  Link.begin(LINK_BAUD, SERIAL_8N1, LINK_RX, LINK_TX);
+  requestId = esp_random();
+  pinMode(LEVEL_PIN, INPUT);
+  pinMode(TURBIDITY_PIN, INPUT);
   analogReadResolution(12);
-
-  analogSetPinAttenuation(
-    TURBIDITY_PIN,
-    ADC_11db
-  );
-
-  // ---------------------------------------------------
-  // DS18B20
-  // ---------------------------------------------------
-
+  // Retains the supplied converter's low-voltage ADC configuration.
+  // Revisit attenuation AND calibration if converter output range changes.
+  analogSetPinAttenuation(LEVEL_PIN, ADC_0db);
+  analogSetPinAttenuation(TURBIDITY_PIN, ADC_11db);
   sensors.begin();
-
-  // VERY IMPORTANT:
-  // Do not block while waiting for
-  // temperature conversion.
-  sensors.setWaitForConversion(false);
-
-  int sensorCount =
-    sensors.getDeviceCount();
-
-  Serial.printf(
-    "DS18B20 sensors found: %d\n",
-    sensorCount
-  );
-
-  // updateTemperature() schedules and tracks each conversion.
+  // Same blocking conversion setup as the working GPIO19 test.
+  sensors.setWaitForConversion(true);
   sensors.setResolution(12);
-
   initLoRa();
-
-  // ---------------------------------------------------
-  // READY
-  // ---------------------------------------------------
-
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-  Serial.println(
-    "     HERDRA WATER MONITOR"
-  );
-  Serial.println(
-    "=============================="
-  );
-
-  Serial.println(
-    "Camera    : GPIO6 RX / GPIO7 TX"
-  );
-
-  Serial.println(
-    "Turbidity : GPIO5"
-  );
-
-  Serial.println(
-    "Temperature: GPIO19"
-  );
-
-  Serial.println();
-
-  delay(500);
-
+  Serial.println("HERDRA: 5 sequential rounds, then medians and one LoRa packet");
+  Serial.println("Level=GPIO3 Turbidity=GPIO4 Temperature=GPIO19 UART=6/7");
+  Serial.printf("Temperature sensors found: %d\n", sensors.getDeviceCount());
+  Serial.println("Sending raw mV; calibration lives in the TroughWatch app.");
   drawScreen();
 }
 
-// =====================================================
-// MAIN LOOP
-// =====================================================
-
 void loop() {
-
-  static uint32_t lastDrawMs = 0;
-
   Radio.IrqProcess();
-
-  // Camera checked continuously
-  receiveCameraData();
-
-  // Turbidity sampling
-  updateTurbidity();
-
-  // DS18B20 temperature
-  updateTemperature();
-
-  sendLoRaData();
-
-  // OLED refresh 4 times / second
-  if (
-    millis() - lastDrawMs >= 250
-  ) {
-
-    lastDrawMs = millis();
-
+  receiveCamera();
+  const uint32_t now = millis();
+  float mv = NAN;
+  switch (stage) {
+    case WAIT_CYCLE:
+      if (firstCycle || now - cycleMs >= CYCLE_INTERVAL_MS) startBatch();
+      break;
+    case SYNC_CAMERA:
+      // Retry synchronization; do not sample while camera state is unknown.
+      if (now - stageMs >= SYNC_RETRY_MS) {
+        Serial.println("Waiting for camera idle: check both firmwares and UART wiring");
+        syncCamera(recovering);
+      }
+      break;
+    case LEVEL_SETTLE:
+      if (now - stageMs >= SETTLE_MS) startADC(LEVEL_PIN, LEVEL_SAMPLE);
+      break;
+    case LEVEL_SAMPLE:
+      if (collectADC(LEVEL_PIN, mv)) {
+        if (isfinite(mv)) levelRounds[roundIndex] = mv;
+        Serial.printf("Round %u LEVEL median: %.1f mV\n",
+          (unsigned)(roundIndex + 1), mv);
+        changeStage(TURB_SETTLE);
+        drawScreen();
+      }
+      break;
+    case TURB_SETTLE:
+      if (now - stageMs >= SETTLE_MS) startADC(TURBIDITY_PIN, TURB_SAMPLE);
+      break;
+    case TURB_SAMPLE:
+      if (collectADC(TURBIDITY_PIN, mv)) {
+        if (isfinite(mv)) turbRounds[roundIndex] = mv;
+        Serial.printf("Round %u TURB median: %.1f mV at GPIO4\n",
+          (unsigned)(roundIndex + 1), mv);
+        changeStage(TEMP_READ);
+        drawScreen();
+      }
+      break;
+    case TEMP_READ: {
+        // Request and wait, then read immediately, as in the working test.
+        sensors.requestTemperatures();
+        float t = sensors.getTempCByIndex(0);
+        if (isfinite(t) && t != DEVICE_DISCONNECTED_C && t >= -55 && t <= 125)
+          tempRounds[roundIndex] = t;
+        else
+          Serial.println("Temperature unavailable. Check GPIO19, power, GND and pull-up resistor.");
+        Serial.printf("Round %u TEMP: %.2f C (nan = unavailable)\n",
+          (unsigned)(roundIndex + 1), tempRounds[roundIndex]);
+        activeId = ++requestId;
+        changeStage(CAMERA_WAIT);
+        Link.printf("CAPTURE:%lu\n", (unsigned long)activeId);
+        drawScreen();
+      }
+      break;
+    case CAMERA_WAIT:
+      if (now - stageMs >= CAMERA_TIMEOUT_MS) {
+        cameraHadError = true;
+        Serial.println("Camera timeout; round invalid. Waiting for flash-off confirmation.");
+        syncCamera(true);
+      }
+      break;
+    case TX_WAIT:
+      if (!transmitting) changeStage(WAIT_CYCLE);
+      else if (now - stageMs > TX_TIMEOUT_VALUE + 2000) {
+        // Fallback if no radio callback arrives.
+        OnTxTimeout();
+        changeStage(WAIT_CYCLE);
+      }
+      break;
+  }
+  // Freeze OLED transfers throughout the sensitive analog phases.
+  if ((stage == WAIT_CYCLE || stage == SYNC_CAMERA || stage == TEMP_READ ||
+       stage == CAMERA_WAIT || stage == TX_WAIT) &&
+      millis() - lastDisplayMs >= 500) {
+    lastDisplayMs = millis();
     drawScreen();
   }
 }

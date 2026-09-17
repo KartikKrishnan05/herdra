@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "esp_camera.h"
+#include <stdio.h>
+#include <string.h>
 
 // Prototype: estimates algae-like COLOR coverage, not algae identity/toxicity.
 // Camera pins and RGB565 byte order retained from your working sketch.
@@ -31,9 +33,12 @@ HardwareSerial Link(1);
 #define FLASH_ON_LEVEL HIGH
 #define FLASH_OFF_LEVEL LOW
 #define FLASH_SETTLE_MS 300
-#define FRAMES_PER_CYCLE 3
-#define BETWEEN_FRAMES_MS 150
-#define READING_DELAY_MS 2000
+// One analyzed image per Heltec round. Five rounds give five observations.
+// Discard startup frames under the light to reduce stale/exposure artifacts.
+#define WARMUP_FRAMES 2
+#define WARMUP_GAP_MS 100
+bool cameraReady = false;
+const char *startupError = "INIT";
 #define SWAP_BYTES true
 
 // Starting thresholds, NOT calibrated measurements.
@@ -226,7 +231,8 @@ void setup() {
   Serial.println("\nAlgae-like coverage detector: HSV + spatial filter");
   if (!psramFound()) {
     Serial.println("ERROR: PSRAM not found. Check OPI PSRAM setting.");
-    while (true) delay(1000);
+    startupError = "PSRAM";
+    return;
   }
   camera_config_t c = {};
   c.ledc_channel = LEDC_CHANNEL_0;
@@ -256,42 +262,96 @@ void setup() {
   const esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
     Serial.printf("Camera init FAILED: 0x%x\n", (unsigned int)err);
-    while (true) delay(1000);
+    startupError = "INIT";
+    return;
   }
   Serial.println("Camera OK. UART TX=1 RX=2; flash=14.");
-  Serial.println("Every acquired RGB565 frame sends its own G,C,Q values; no averaging.");
+  cameraReady = true;
+  Serial.println("Waiting for Heltec CAPTURE:id; light stays OFF between requests.");
+}
+
+// This sketch never captures autonomously.
+// Result and error messages are sent only AFTER the light is turned OFF.
+// The Heltec computes medians across five separate requested captures.
+void captureOnce(unsigned long id) {
+  if (!cameraReady) {
+    setFlash(false);
+    Link.printf("E:%lu,%s\n", id, startupError);
+    return;
+  }
+  setFlash(true);
+  delay(FLASH_SETTLE_MS);
+  for (int i = 0; i < WARMUP_FRAMES; ++i) {
+    camera_fb_t *warm = esp_camera_fb_get();
+    if (!warm) {
+      setFlash(false);
+      Link.printf("E:%lu,CAPTURE\n", id);
+      return;
+    }
+    esp_camera_fb_return(warm);
+    delay(WARMUP_GAP_MS);
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    setFlash(false);
+    Link.printf("E:%lu,CAPTURE\n", id);
+    return;
+  }
+  // The frame is already in memory; turn the light off before analysis.
+  setFlash(false);
+  float coverage = 0, quality = 0, confidence = 0;
+  const bool decoded = analyzeFrame(fb, coverage, quality, confidence);
+  esp_camera_fb_return(fb);
+  if (!decoded) {
+    Link.printf("E:%lu,FRAME\n", id);
+    return;
+  }
+  Link.printf("R:%lu,G:%.2f,C:%.2f,Q:%.2f\n",
+              id, coverage, confidence, quality);
+  Serial.printf("Capture %lu: G=%.2f C*=%.2f Q=%.2f; flash OFF\n",
+                id, coverage, confidence, quality);
+  if (quality == 0)
+    Serial.printf("%s: unmeasurable; Heltec must exclude this observation.\n", frameError);
+  else if (quality < MIN_USABLE_PERCENT)
+    Serial.println("Low usable area: coverage uses remaining usable pixels.");
+}
+
+void processCommand(const char *line) {
+  unsigned long id = 0;
+  int used = 0;
+  if (sscanf(line, "PING:%lu%n", &id, &used) == 1 &&
+      used > 0 && line[used] == '\0') {
+    // Commands are handled serially, so this acknowledgment cannot be
+    // sent while captureOnce is running.
+    setFlash(false);
+    Link.printf("IDLE:%lu\n", id);
+    return;
+  }
+  used = 0;
+  if (sscanf(line, "CAPTURE:%lu%n", &id, &used) == 1 &&
+      used > 0 && line[used] == '\0') captureOnce(id);
 }
 
 void loop() {
-  setFlash(true);
-  delay(FLASH_SETTLE_MS);
-  // Process ALL acquired images, including the first frames while exposure
-  // adapts. No warmup frames are discarded. One packet per returned image.
-  for (int n = 0; n < FRAMES_PER_CYCLE; n++) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("No image returned: CAPTURE");
-      Link.println("E:CAPTURE");
-    } else {
-      float coverage = 0, quality = 0, confidence = 0;
-      const bool decoded = analyzeFrame(fb, coverage, quality, confidence);
-      esp_camera_fb_return(fb);
-      if (decoded) {
-        // Current frame only. Confidence is a spatial/color heuristic,
-        // discounted by image quality; it is NOT a probability.
-        Link.printf("G:%.2f,C:%.2f,Q:%.2f\n", coverage, confidence, quality);
-        Serial.printf("TX G:%.2f,C:%.2f,Q:%.2f\n", coverage, confidence, quality);
-        if (quality == 0)
-          Serial.printf("%s: zeros mean UNMEASURABLE, not no algae.\n", frameError);
-        else if (quality < MIN_USABLE_PERCENT)
-          Serial.println("LOW quality: coverage uses the remaining usable pixels.");
-      } else {
-        Serial.println("Image cannot be decoded: FRAME");
-        Link.println("E:FRAME");
+  static char line[48];
+  static size_t pos = 0;
+  static bool discard = false;
+  while (Link.available()) {
+    const int ch = Link.read();
+    if (ch < 0) break;
+    if (ch == '\n' || ch == '\r') {
+      if (!discard && pos) {
+        line[pos] = '\0';
+        processCommand(line);
       }
+      pos = 0;
+      discard = false;
+    } else if (!discard) {
+      if (ch < 32 || ch > 126 || pos >= sizeof(line) - 1) {
+        discard = true;
+        pos = 0;
+      } else line[pos++] = (char)ch;
     }
-    if (n + 1 < FRAMES_PER_CYCLE) delay(BETWEEN_FRAMES_MS);
   }
-  setFlash(false);
-  delay(READING_DELAY_MS);
+  delay(1);
 }

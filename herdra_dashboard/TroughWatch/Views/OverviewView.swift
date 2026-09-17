@@ -9,6 +9,9 @@ struct MainTabView: View {
             MapScreen()
                 .tabItem { Label("Map", systemImage: "map.fill") }
 
+            DeveloperView()
+                .tabItem { Label("Developer", systemImage: "waveform.path.ecg") }
+
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
         }
@@ -57,15 +60,18 @@ struct OverviewView: View {
                 }
             }
 
-            Section("Devices") {
-                ForEach(store.troughs) { trough in
+            Section("Troughs") {
+                let ordered = store.troughsByUrgency
+                ForEach(ordered) { trough in
                     NavigationLink {
                         TroughDetailView(troughID: trough.id)
                     } label: {
-                        TroughRow(trough: trough, distance: store.distanceFromHome(to: trough))
+                        TroughRow(trough: trough, assessment: store.assessment(for: trough))
                     }
                 }
-                .onDelete { store.delete(at: $0) }
+                .onDelete { offsets in
+                    offsets.map { ordered[$0] }.forEach(store.delete)
+                }
             }
         }
         .listStyle(.insetGrouped)
@@ -100,10 +106,9 @@ struct SummaryBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            tile(count: store.troughs.count, label: "Devices", tint: .accentColor, symbol: "antenna.radiowaves.left.and.right")
-            tile(count: store.healthyCount, label: "Fine", tint: .green, symbol: "checkmark.circle.fill")
-            tile(count: store.warningCount, label: "Check", tint: .orange, symbol: "exclamationmark.triangle.fill")
-            tile(count: store.alertCount, label: "Bad", tint: .red, symbol: "xmark.octagon.fill")
+            tile(count: store.healthyCount, label: WaterStatus.good.shortLabel, tint: .green, symbol: WaterStatus.good.symbol)
+            tile(count: store.warningCount, label: WaterStatus.warning.shortLabel, tint: .orange, symbol: WaterStatus.warning.symbol)
+            tile(count: store.alertCount, label: WaterStatus.bad.shortLabel, tint: .red, symbol: WaterStatus.bad.symbol)
         }
     }
 
@@ -127,39 +132,32 @@ struct SummaryBar: View {
 
 struct TroughRow: View {
     let trough: Trough
-    let distance: Double?
+    let assessment: TroughAssessment
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: trough.status.symbol)
-                .font(.title3)
-                .foregroundStyle(trough.status.tint)
-                .frame(width: 28)
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: assessment.status.symbol)
+                .font(.title2)
+                .foregroundStyle(assessment.status.tint)
+                .frame(width: 30)
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(trough.name)
-                    .font(.headline)
-                HStack(spacing: 6) {
-                    Text(trough.deviceID)
-                    if let distance {
-                        Text("·")
-                        Text("\(Format.distance(distance)) from home")
-                    }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(trough.name)
+                        .font(.headline)
+                    Spacer()
+                    Text(assessment.status.shortLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(assessment.status.tint)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            VStack(alignment: .trailing, spacing: 3) {
-                Text(trough.status.shortLabel)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(trough.status.tint)
-                if let reading = trough.lastReading {
-                    Text(Format.relative(reading.timestamp))
+                Text(assessment.summary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                if let lastHeard = assessment.lastHeard {
+                    Text("Updated \(Format.relative(lastHeard))")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.tertiary)
                 }
             }
         }

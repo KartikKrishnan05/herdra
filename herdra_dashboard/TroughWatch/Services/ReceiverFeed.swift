@@ -83,23 +83,15 @@ struct ReceiverSettings: Equatable {
 
 // MARK: - What comes back
 
-/// One packet in the receiver's buffer, for the history chart.
-struct FeedHistoryPoint: Hashable, Identifiable {
-    var id: Int
-    var time: String
-    var temperature: Double?
-    var turbidity: Double?
-    var algae: Double?
-    var quality: Double?
-}
-
 /// One LoRa packet, decoded into a reading.
-struct FeedPacket {
+struct FeedPacket: Identifiable {
     /// The receiver's running packet number.
     var number: Int
     var reading: Reading
     /// Device ID if the LoRa line carried one.
     var deviceID: String?
+
+    var id: String { reading.packetKey ?? "\(number)" }
 }
 
 /// Receiver-wide counters from the `/data` response.
@@ -116,7 +108,6 @@ struct ReceiverInfo: Equatable {
 struct FeedSnapshot {
     /// Oldest to newest, at most the 50 the receiver keeps.
     var packets: [FeedPacket]
-    var history: [FeedHistoryPoint]
     var info: ReceiverInfo
 
     var latest: FeedPacket? { packets.last }
@@ -146,8 +137,9 @@ struct HeltecPacket: Decodable {
 // MARK: - Reading the LoRa line
 
 /// The receiver no longer has a server in front of it to parse packets, so the
-/// app does it: the sender's `TEMP=21.4,TURB=12,LEVEL=35,...` line is split
-/// here into the fields a `Reading` holds.
+/// app does it: the sender's `TEMP=21.4,LVL_MV=230.5,TURB_MV=2650.0,...` line
+/// is split here into the fields a `Reading` holds. The raw voltages are turned
+/// into cm and % later, by the calibration of the trough the packet belongs to.
 enum LoRaMessage {
 
     private static let idKeys: Set<String> = ["ID", "DEV", "DEVICE", "NODE", "STATION"]
@@ -197,18 +189,27 @@ enum LoRaMessage {
 
     /// The measurement half of a reading; radio and timing are filled in by
     /// the caller, which knows them from the receiver rather than the line.
+    /// `TURB` and `LEVEL` are what firmware from before the raw-voltage change
+    /// sent, already converted.
     static func reading(from message: String) -> Reading {
         let f = fields(in: message)
         return Reading(
             temperatureC: number(f, "TEMP", "TEMPERATURE", "T"),
-            turbidityNTU: number(f, "TURB", "TURBIDITY", "NTU"),
+            levelMV: number(f, "LVL_MV", "LEVEL_MV"),
+            turbidityMV: number(f, "TURB_MV"),
+            turbidityPercent: number(f, "TURB", "TURBIDITY"),
             waterLevelCM: number(f, "LEVEL", "WATER_LEVEL", "WL"),
-            algae: number(f, "ALGAE", "ALG"),
+            cameraAlgae: number(f, "ALGAE", "ALG"),
             confidence: number(f, "CONF", "CONFIDENCE"),
             quality: number(f, "QUALITY", "QUAL", "Q"),
             cameraFresh: number(f, "CAM_FRESH", "FRESH").map { $0 != 0 },
             cameraErrorCode: number(f, "CAM_ERR", "CAM_ERROR", "ERR").map { Int($0) },
             cameraAgeSeconds: number(f, "CAM_AGE"),
+            validLevelRounds: number(f, "N_LVL").map { Int($0) },
+            validTurbidityRounds: number(f, "N_TURB").map { Int($0) },
+            validTemperatureRounds: number(f, "N_TEMP").map { Int($0) },
+            validCameraRounds: number(f, "N_CAM").map { Int($0) },
+            batch: number(f, "BATCH").map { Int($0) },
             rawMessage: message
         )
     }
@@ -235,8 +236,10 @@ final class ReceiverClient: ObservableObject {
     }
 
     @Published private(set) var state: ConnectionState = .off
-    @Published private(set) var history: [FeedHistoryPoint] = []
     @Published private(set) var info: ReceiverInfo?
+    /// Everything in the receiver's buffer as of the last poll, oldest first,
+    /// for the Developer tab.
+    @Published private(set) var packets: [FeedPacket] = []
     @Published private(set) var lastSnapshotAt: Date?
 
     @Published var settings: ReceiverSettings {
@@ -338,8 +341,8 @@ final class ReceiverClient: ObservableObject {
             let feed = try JSONDecoder().decode(HeltecResponse.self, from: cleaned)
             let snapshot = makeSnapshot(from: feed)
 
-            history = snapshot.history
             info = snapshot.info
+            packets = snapshot.packets
             lastSnapshotAt = .now
 
             if let latest = snapshot.latest {
@@ -381,7 +384,7 @@ final class ReceiverClient: ObservableObject {
 
             return FeedPacket(
                 number: raw.id,
-                reading: StatusRule.applied(to: reading),
+                reading: reading,
                 deviceID: LoRaMessage.deviceID(in: raw.msg)
             )
         }
@@ -389,20 +392,8 @@ final class ReceiverClient: ObservableObject {
         // Forget packets the receiver has dropped out of its buffer.
         arrivals = seen
 
-        let history = packets.map { packet in
-            FeedHistoryPoint(
-                id: packet.number,
-                time: packet.reading.serverTime ?? "",
-                temperature: packet.reading.temperatureC,
-                turbidity: packet.reading.turbidityNTU,
-                algae: packet.reading.algae,
-                quality: packet.reading.quality
-            )
-        }
-
         return FeedSnapshot(
             packets: packets,
-            history: history,
             info: ReceiverInfo(
                 totalPackets: feed.total,
                 clients: feed.clients,

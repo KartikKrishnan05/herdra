@@ -48,8 +48,12 @@ struct RootView: View {
             // also fires for a permission alert or the app switcher, and the
             // feed should still be running when the farmer comes straight back.
             switch phase {
-            case .active: receiver.start()
-            case .background: receiver.stop()
+            case .active:
+                store.refreshAssessments()
+                receiver.start()
+            case .background:
+                receiver.stop()
+                store.flush()
             default: break
             }
         }

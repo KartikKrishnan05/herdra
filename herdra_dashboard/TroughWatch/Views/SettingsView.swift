@@ -90,6 +90,28 @@ struct SettingsView: View {
 
                 if !store.troughs.isEmpty {
                     Section {
+                        ForEach(store.troughs) { trough in
+                            HStack {
+                                Text(trough.name)
+                                Spacer()
+                                TextField("Full level", value: Binding(
+                                    get: { trough.fullLevelCM },
+                                    set: { store.setFullLevel($0, for: trough) }
+                                ), format: .number.precision(.fractionLength(0...1)))
+                                .keyboardType(.decimalPad)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 80)
+                                Text("cm")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } header: {
+                        Text("Water depth when full")
+                    } footer: {
+                        Text("Measure how deep the water is when each trough is filled as far as you want it. The app calls it \"getting low\" below \(Int(Assessment.gettingLowLevelShare * 100)) % of this, \"very low\" below \(Int(Assessment.lowLevelShare * 100)) %, and \"dropping fast\" when it falls more than \(Int(Assessment.fastDropSharePerHour * 100)) % of it per hour.")
+                    }
+
+                    Section {
                         Picker("Readings belong to", selection: Binding(
                             get: { receiver.settings.stationTroughID },
                             set: { receiver.settings.stationTroughID = $0 }
@@ -104,19 +126,6 @@ struct SettingsView: View {
                     } footer: {
                         Text("Packets without a device ID go to this trough. If the sender adds ID=DEV-002 (or DEV=, NODE=, STATION=) to its message, the packet goes to the trough with that device ID instead.")
                     }
-                }
-
-                Section {
-                    Button {
-                        store.simulateIncomingReadings()
-                    } label: {
-                        Label("Fake a round of readings", systemImage: "wave.3.right")
-                    }
-                    .disabled(store.troughs.isEmpty)
-                } header: {
-                    Text("Without a station")
-                } footer: {
-                    Text("Fills every active trough with a made-up packet, judged by the same rules as a real one, so you can see the map colours and the alert counts move with nothing on the network.")
                 }
 
                 Section {

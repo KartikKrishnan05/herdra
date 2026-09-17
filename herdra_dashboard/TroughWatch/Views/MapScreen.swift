@@ -22,14 +22,15 @@ struct MapScreen: View {
                 }
 
                 ForEach(store.troughs) { trough in
-                    if trough.status.needsAttention {
+                    let status = store.status(of: trough)
+                    if status.needsAttention {
                         MapCircle(center: trough.coordinate.clCoordinate, radius: attentionRadius)
-                            .foregroundStyle(trough.status.tint.opacity(0.22))
-                            .stroke(trough.status.tint, lineWidth: 2)
+                            .foregroundStyle(status.tint.opacity(0.22))
+                            .stroke(status.tint, lineWidth: 2)
                     }
 
                     Annotation(trough.name, coordinate: trough.coordinate.clCoordinate) {
-                        TroughMarker(trough: trough, isSelected: selection == trough.id)
+                        TroughMarker(status: status, isSelected: selection == trough.id)
                     }
                     .tag(trough.id)
                 }
@@ -43,14 +44,19 @@ struct MapScreen: View {
                 MapScaleView()
             }
             .safeAreaInset(edge: .bottom) {
-                if let trough = selectedTrough {
-                    SelectedTroughCard(trough: trough, distance: store.distanceFromHome(to: trough)) {
-                        selection = nil
+                VStack(alignment: .trailing, spacing: 10) {
+                    if !store.troughs.isEmpty {
+                        ShowAllButton { fitAll(animated: true) }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    if let trough = selectedTrough {
+                        SelectedTroughCard(trough: trough, distance: store.distanceFromHome(to: trough)) {
+                            selection = nil
+                        }
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
             }
             .navigationTitle("Map")
             .navigationBarTitleDisplayMode(.inline)
@@ -62,12 +68,7 @@ struct MapScreen: View {
                         Label("Map style", systemImage: satellite ? "globe.europe.africa.fill" : "map")
                     }
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        fitAll(animated: true)
-                    } label: {
-                        Label("Fit all", systemImage: "arrow.up.left.and.arrow.down.right")
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showingAdd = true
                     } label: {
@@ -100,6 +101,23 @@ struct MapScreen: View {
         } else {
             camera = .region(region)
         }
+    }
+}
+
+/// Floating button that zooms the map out until every trough is in view.
+struct ShowAllButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label("Show all troughs", systemImage: "arrow.up.left.and.arrow.down.right")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.regularMaterial, in: Capsule())
+                .shadow(radius: 4, y: 2)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -158,13 +176,13 @@ struct HomeMarker: View {
 }
 
 struct TroughMarker: View {
-    let trough: Trough
+    let status: WaterStatus
     let isSelected: Bool
 
     var body: some View {
         ZStack {
             Circle()
-                .fill(trough.status.tint)
+                .fill(status.tint)
                 .frame(width: isSelected ? 38 : 30, height: isSelected ? 38 : 30)
                 .overlay(Circle().stroke(.white, lineWidth: 2.5))
                 .shadow(radius: 3, y: 1)
@@ -185,11 +203,13 @@ struct SelectedTroughCard: View {
     let onClose: () -> Void
 
     var body: some View {
+        let assessment = store.assessment(for: trough)
+        let status = assessment.status
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label(trough.name, systemImage: trough.status.symbol)
+                Label(trough.name, systemImage: status.symbol)
                     .font(.headline)
-                    .foregroundStyle(trough.status.tint)
+                    .foregroundStyle(status.tint)
                 Spacer()
                 Button {
                     onClose()
@@ -200,18 +220,15 @@ struct SelectedTroughCard: View {
                 .buttonStyle(.plain)
             }
 
-            Text(trough.status.label)
+            Text(assessment.summary)
                 .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 10) {
-                Text(trough.deviceID)
-                if let distance {
-                    Text("·")
-                    Text("\(Format.distance(distance)) from home")
-                }
+            if let distance {
+                Text("\(Format.distance(distance)) from home")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
 
             NavigationLink {
                 TroughDetailView(troughID: trough.id)
@@ -225,7 +242,7 @@ struct SelectedTroughCard: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
         .overlay(
             RoundedRectangle(cornerRadius: 16)
-                .stroke(trough.status.needsAttention ? trough.status.tint : Color.clear, lineWidth: 2)
+                .stroke(status.needsAttention ? status.tint : Color.clear, lineWidth: 2)
         )
         .shadow(radius: 8, y: 3)
     }
