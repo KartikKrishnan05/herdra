@@ -2,6 +2,8 @@
 
 Floating water-quality monitors for livestock water troughs, with a LoRa link to the farmhouse and an iPhone app that tells the farmer which trough needs attention.
 
+Built by a team of five during the two-week **THINK. MAKE. START.** makeathon at UnternehmerTUM: a solar-powered prototype for remote livestock farms covering sensors, firmware, a mobile app and a business case.
+
 Each floating station measures **water level, turbidity, temperature and algae coverage**, sends a compact LoRa packet every 30 seconds, and a receiver at the house serves the data over its own Wi-Fi. The iOS app (TroughWatch) turns raw readings into a simple *all good / keep an eye on it / needs attention* status per trough, on a map.
 
 ```
